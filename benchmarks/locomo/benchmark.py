@@ -1,10 +1,16 @@
 """Unified CLI for LOCOMO evaluation harness."""
 
 # 这个文件是 LOCOMO benchmark 的统一命令行入口。
-# 整体逻辑不是直接在 main 中写所有流程，而是先定义三个异步业务函数：
-# ingest_data 负责把 LOCOMO 数据写入 Zep 图；evaluate_data 负责跑评估并保存结果；
-# cleanup_users 负责列出或删除带指定前缀的图。
-# main() 只负责解析命令行参数、初始化日志，然后根据互斥模式分发到对应业务函数。
+# 它本身不直接实现“数据如何写入 Zep 图”或“如何评测回答质量”，
+# 而是负责把命令行参数、配置文件、外部客户端和具体 Runner 串起来。
+#
+# 整体执行主线：
+#   main()
+#     -> 读取 .env 环境变量
+#     -> 解析命令行参数
+#     -> 初始化 logger
+#     -> 根据 --ingest / --eval / --cleanup 选择一个异步任务
+#     -> asyncio.run(...) 执行对应流程
 
 import argparse
 import asyncio
@@ -13,76 +19,76 @@ import os
 import sys
 from pathlib import Path
 
-# .env 用来把 ZEP_API_KEY、OPENAI_API_KEY 等本地环境变量加载到 os.environ。
+# load_dotenv 会读取 .env 文件，把 ZEP_API_KEY、OPENAI_API_KEY 等变量放进 os.environ。
+# 后面的 AsyncZep / AsyncOpenAI 初始化都依赖这些环境变量。
 from dotenv import load_dotenv
-
-# AsyncOpenAI 用于评估阶段调用 OpenAI 模型生成回答或打分。
 from openai import AsyncOpenAI
-
-# AsyncZep 是 Zep Cloud 的异步客户端，ingest/eval/cleanup 三个模式都会围绕它访问图数据。
 from zep_cloud.client import AsyncZep
 
-# 以下几个本地模块把具体业务拆开：
-# config 负责读取 benchmark 配置；evaluation/ingestion 分别封装评估和导入流程；
-# persistence 负责把每轮结果、实验汇总和配置快照落盘。
+# load_config 负责把 benchmark_config.yaml 之类的配置文件解析成结构化 config。
+# 三个 Runner 分别承担具体业务：
+#   IngestionRunner：把 LOCOMO 数据写入 Zep graph
+#   EvaluationRunner：基于 Zep graph 检索上下文并调用模型回答/评测
+#   ResultsPersistence：保存每轮结果、汇总指标、实验目录
 from config import load_config
 from evaluation import EvaluationRunner
 from ingestion import IngestionRunner
 from persistence import ResultsPersistence
 
 
+# 日志配置是整个 CLI 的基础设施：所有模式都会复用同一个 logger。
+# 这里返回 logger，而不是直接使用 root logger，是为了让 LOCOMO benchmark 的日志有固定命名空间 "locomo"。
 def setup_logging(log_level: str) -> logging.Logger:
     """Setup logging configuration."""
-    # 统一使用名为 locomo 的 logger，让整套 CLI 的日志来源保持一致。
-    # log_level 来自命令行参数，先转成大写，再映射到 logging.DEBUG/INFO 等常量。
     logger = logging.getLogger("locomo")
     logger.setLevel(getattr(logging, log_level.upper()))
 
-    # 日志默认输出到标准错误流，适合 CLI 场景；格式中包含时间、logger 名称、级别和消息。
-    # 后续业务函数只拿 logger 打日志，不需要关心输出到哪里、格式是什么。
+    # StreamHandler 默认输出到 stderr，适合 CLI 程序实时查看运行状态。
+    # formatter 统一日志格式，让 ingestion/evaluation/cleanup 的日志能用同一套时间和等级标记阅读。
     handler = logging.StreamHandler()
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-    # 返回配置好的 logger，作为依赖传给 ingest/eval/cleanup，避免每个函数重复创建。
     return logger
 
 
+# --ingest 模式对应的执行函数。
+# 它只负责“准备依赖 + 调用 IngestionRunner”，不直接处理 LOCOMO 文件细节。
 async def ingest_data(args: argparse.Namespace, logger: logging.Logger) -> None:
     """Ingest LOCOMO data into Zep using graph API."""
-    # 入口参数只保存命令行层面的选择；真正控制导入行为的参数放在配置文件中。
-    # 因此第一步先读取 args.config 指向的配置，再把配置交给 runner。
     # Load config
+    # 配置文件决定 LOCOMO 数据范围、Zep 图参数、模型参数等。
+    # ingest 阶段虽然主要写图，但仍需要统一配置来决定数据集规模和命名空间。
     config = load_config(args.config)
 
-    # Zep 客户端只需要 API key。这里假设 main() 已经调用 load_dotenv，
-    # 所以 os.getenv 可以同时读取系统环境变量和 .env 文件中的变量。
     # Initialize Zep client
+    # Zep 是图存储/检索后端；这里使用异步客户端，因为后续 ingestion 会大量调用网络 API。
+    # API key 从环境变量读取，所以 main() 必须先 load_dotenv()。
     zep = AsyncZep(api_key=os.getenv("ZEP_API_KEY"))
 
-    # IngestionRunner 汇总了导入 LOCOMO 的所有细节。
-    # prefix 用于命名空间隔离：不同实验可以使用不同前缀，避免图 ID 互相污染。
     # Create ingestion runner
+    # prefix 用于给 graph/user 命名加命名空间，避免不同实验互相污染。
     ingestion_runner = IngestionRunner(config, zep, logger, prefix=args.prefix)
 
-    # 真正的数据读取、图创建、节点/边写入都封装在 ingest_locomo() 里。
-    # 这里 await 它，保证导入完成后才打印完成日志。
     # Ingest LOCOMO dataset
+    # 真正的数据读取、session 遍历、写入 graph API 的逻辑被封装在 runner 内部。
     await ingestion_runner.ingest_locomo()
 
     logger.info("Ingestion complete!")
 
 
+# --eval 模式对应的执行函数。
+# 它比 ingest 更复杂，因为要做：展示实验配置、初始化 Zep/OpenAI、读取数据、执行一轮或多轮评测、保存结果、打印摘要。
 async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> None:
     """Run LOCOMO evaluation using graph API."""
-    # 评估流程首先读取配置。后面的模型选择、检索参数、并发度、数据规模都来自这里。
     # Load config
+    # eval 阶段需要读取完整配置：数据规模、检索参数、回答模型、grader 模型、并发度等都会影响结果。
     config = load_config(args.config)
 
-    # 先把实验配置打印到终端，是为了让每次评估的上下文在日志/控制台中可追溯。
-    # 这些信息不会影响运行逻辑，但能帮助比较不同配置或多轮实验的差异。
     # Print experimental setup
+    # 这段不是业务逻辑，而是为了让每次实验在终端里自描述。
+    # 后面保存结果时也会保存 config；这里先打印出来，便于人工确认当前跑的是哪套参数。
     print("\n" + "=" * 70)
     print("LOCOMO EVALUATION - EXPERIMENTAL SETUP")
     print("=" * 70)
@@ -107,74 +113,74 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
     print(f"  Number of runs: {args.num_runs}")
     print("=" * 70 + "\n")
 
-    # 评估阶段同时需要访问 Zep 图数据和 OpenAI 模型：
-    # Zep 负责检索上下文，OpenAI 负责生成回答/可能也参与 grader。
     # Initialize clients
+    # eval 同时依赖两个外部服务：
+    #   Zep：读取 graph retrieval 上下文
+    #   OpenAI：生成回答或调用 grader 模型
     zep = AsyncZep(api_key=os.getenv("ZEP_API_KEY"))
     openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    # EvaluationRunner 负责“如何评估”，ResultsPersistence 负责“如何保存”。
-    # 这样运行流程可以先拿到 results，再根据单轮/多轮实验选择不同保存方式。
     # Create runners
+    # EvaluationRunner 负责“对每个问题跑检索 + 回答 + 评分”的主流程。
+    # ResultsPersistence 负责把结果落盘，并从原始 results 计算指标。
     evaluation_runner = EvaluationRunner(config, zep, openai_client, logger, prefix=args.prefix)
     persistence = ResultsPersistence(config, logger)
 
-    # LOCOMO 原始数据用 pandas 读取成 DataFrame。
-    # import 放在函数内部可以让非评估模式不必加载 pandas，减少 CLI 其他模式的依赖成本。
     # Load LOCOMO data
+    # pandas 只在 eval 路径需要，因此放在函数内部导入，避免 ingest/cleanup 模式产生不必要依赖。
     import pandas as pd
 
+    # 评测依赖本地 LOCOMO 数据文件。
+    # 如果文件不存在，说明用户还没有准备/下载数据，或者没有先跑 ingestion 所需的数据准备流程。
     data_path = Path("data") / "locomo.json"
     if not data_path.exists():
-        # 评估依赖本地数据文件；如果缺失，直接退出并提示先运行 ingestion。
-        # 这里用 sys.exit(1) 明确告诉 shell 此次命令失败。
         logger.error(f"LOCOMO data not found at {data_path}. Run ingestion first.")
         sys.exit(1)
 
+    # LOCOMO JSON 被读成 DataFrame，后续 EvaluationRunner 可以按行遍历问题、答案、类别和元数据。
     df = pd.read_json(data_path)
 
-    # 这些列表贯穿整个评估循环：
-    # all_run_metrics 保存每轮聚合指标，all_run_dirs 保存每轮结果目录，
-    # all_run_results 只在多轮实验时用于最终汇总原始结果。
     # Run evaluation multiple times
+    # 这些列表是跨 run 的聚合容器：
+    #   all_run_metrics：每一轮的指标对象，用于最终打印均值/方差
+    #   all_run_dirs：每一轮保存目录，用于展示结果位置
+    #   all_run_results：多轮实验时保存所有原始样本结果，供 experiment summary 聚合
     all_run_metrics = []
     all_run_dirs = []
     all_run_results = []  # Collect raw results from all runs
 
-    # 单轮评估可以直接保存到一个时间戳目录；多轮评估则先创建一个实验总目录，
-    # 后续每一轮都放在这个总目录下，最后再生成跨轮 summary。
     # Create experiment directory for multi-run experiments
+    # 单轮评测可以直接创建一个 timestamped run 目录；
+    # 多轮评测需要先创建一个 experiment 根目录，然后每个 run 放到其子目录下，最后再保存总 summary。
     experiment_dir = None
     if args.num_runs > 1:
         experiment_dir = persistence.save_experiment(args.config)
         logger.info(f"Created experiment directory: {experiment_dir}")
 
-    # run_num 从 1 开始，是为了输出和文件命名更贴近人类阅读习惯。
-    # 每轮都复用同一个 evaluation_runner 和同一个 DataFrame，差异主要来自模型随机性或外部服务状态。
+    # 每一轮 run 都完整执行一次 evaluate_locomo，并单独保存结果与指标。
+    # 多轮通常用于观察随机性、模型温度、检索波动或 grader 波动。
     for run_num in range(1, args.num_runs + 1):
         if args.num_runs > 1:
-            # 多轮时打印醒目的分隔符，避免控制台中不同 run 的日志混在一起难以定位。
             print(f"\n{'=' * 70}")
             print(f"STARTING RUN {run_num}/{args.num_runs}")
             print(f"{'=' * 70}\n")
             logger.info(f"Starting evaluation run {run_num}/{args.num_runs}")
 
-        # evaluate_locomo 是每轮评估的核心：它遍历数据集中的问题，执行检索、回答、打分等步骤，
-        # 最终返回当前 run 的原始结果列表。
         # Run evaluation
+        # evaluate_locomo 返回的是样本级结果列表；每个元素通常包含问题、模型回答、评分、检索上下文、耗时等。
         results = await evaluation_runner.evaluate_locomo(df)
 
-        # 保存策略根据是否存在 experiment_dir 分流。
-        # experiment_dir 不为 None 表示多轮实验，每轮需要带 run_number 存入同一个实验目录；
-        # 否则就是单轮实验，直接创建一个独立的时间戳目录。
         # Save results
+        # 保存策略取决于是否是多轮实验：
+        #   多轮：所有 run 共享 experiment_dir，run_number 用来区分子目录
+        #   单轮：直接保存到一个 timestamped 目录
         if experiment_dir is not None:
             # Multi-run: save to experiment directory
             run_dir = persistence.save_run(
                 results, args.config, run_number=run_num, experiment_dir=experiment_dir
             )
-            # 多轮实验不仅要保存每轮文件，还要把每轮原始结果攒起来，供 save_experiment_summary 做总体汇总。
             # Collect raw results for aggregation
+            # 多轮实验需要把每轮原始结果都累积起来，最后生成跨 run 的 experiment_summary。
             all_run_results.extend(results)
         else:
             # Single run: use timestamped directory
@@ -182,22 +188,19 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
 
         all_run_dirs.append(run_dir)
 
-        # 指标计算在保存之后执行，逻辑上把“结果落盘”和“指标展示/汇总”分开。
-        # 这里调用的是 persistence 的内部计算函数，说明指标结构和保存逻辑被放在同一个持久化模块中维护。
         # Calculate metrics
+        # 指标计算放在保存之后，这样即使打印或聚合出错，原始结果也已经落盘。
         metrics = persistence._calculate_metrics(results)
         all_run_metrics.append(metrics)
 
-    # 多轮实验结束后，才有足够信息生成跨轮 summary：包括每轮指标，以及合并后的原始结果。
     # Save experiment summary for multi-run experiments
+    # 多轮模式下，除了每轮结果，还需要一个跨 run 的 summary，便于比较平均准确率、波动、完整上下文占比等。
     if experiment_dir is not None:
         persistence.save_experiment_summary(experiment_dir, all_run_metrics, all_run_results)
 
-    # 输出汇总时再次分成单轮和多轮：
-    # 单轮侧重详细指标，多轮侧重统计分布和实验目录结构。
     # Print summary output
+    # 终端摘要分两种：单轮打印详细指标；多轮打印聚合统计和每轮简表。
     if args.num_runs == 1:
-        # 单轮时只有一个 metrics，因此直接取 all_run_metrics[0] 展示完整评估面板。
         # Single run - print detailed metrics
         metrics = all_run_metrics[0]
         print("\n" + "=" * 70)
@@ -205,8 +208,8 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
         print("=" * 70)
         print(f"\nAccuracy: {metrics.accuracy:.3f} ({metrics.correct_count}/{metrics.total_count})")
 
-        # Context Completeness 用来区分“答案是否正确”和“检索上下文是否足够”。
-        # 这能帮助判断错误来自生成模型、检索模块，还是数据上下文本身不足。
+        # Context Completeness 用来评估“检索上下文是否足以回答问题”。
+        # 它和最终 accuracy 分开统计，可以帮助判断错误来自检索不足还是模型回答/推理问题。
         print("\nContext Completeness:")
         print(
             f"  COMPLETE: {metrics.completeness_complete_rate:.3f} "
@@ -220,16 +223,15 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
             f"  INSUFFICIENT: {metrics.completeness_insufficient_rate:.3f} "
             f"({metrics.completeness_insufficient_count}/{metrics.total_count})"
         )
+        # 如果存在“上下文完整时的准确率”，就单独打印。
+        # 这个指标能回答：当检索已经给够信息时，生成模型本身答得怎么样。
         if metrics.accuracy_with_complete_context is not None:
-            # 只有当存在完整上下文样本时，才展示“完整上下文下的准确率”。
-            # 这个条件避免没有分母时打印无意义指标。
             print(
                 f"  Accuracy w/ Complete Context: {metrics.accuracy_with_complete_context:.3f} "
                 f"({metrics.correct_with_complete_context}/{metrics.total_with_complete_context})"
             )
 
-        # 延迟指标分成 response 和 retrieval，分别观察生成阶段与检索阶段的性能瓶颈。
-        # median 反映典型体验，p95/p99 反映长尾慢请求。
+        # Latency Statistics 把回答耗时和检索耗时分开打印，便于定位瓶颈在 retrieval 还是 response generation。
         print("\nLatency Statistics:")
         print(
             f"  Response time - median: {metrics.response_duration_stats.median:.3f}s, "
@@ -242,7 +244,8 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
             f"p99: {metrics.retrieval_duration_stats.p99:.3f}s"
         )
 
-        # token 统计用于判断检索上下文是否过长，或是否在不同配置下导致 prompt 成本变化。
+        # Context Token Statistics 反映检索上下文大小。
+        # 它通常和准确率、延迟、成本有关：上下文太少可能信息不足，太多可能变慢或干扰模型。
         print("\nContext Token Statistics:")
         print(
             f"  Tokens - median: {metrics.context_token_stats.median:.0f}, "
@@ -251,7 +254,7 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
             f"p99: {metrics.context_token_stats.p99:.0f}"
         )
 
-        # 按 category 拆分准确率，方便定位某类问题是否显著更难。
+        # 分类维度的准确率可以帮助定位某些问题类型是否特别难，或某类检索上下文是否不足。
         print("\nBy Category:")
         for cat_metrics in metrics.by_category:
             print(
@@ -262,17 +265,16 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
         print(f"\nResults saved to: {all_run_dirs[0]}")
         print("=" * 70 + "\n")
     else:
-        # 多轮模式需要计算跨 run 的均值、标准差、最小值、最大值。
-        # mean/stdev 只在这里使用，所以局部导入即可。
         # Multiple runs - print aggregated statistics
+        # 多轮聚合只在这里才需要 statistics，因此延迟导入。
         from statistics import mean, stdev
 
         print("\n" + "=" * 70)
         print(f"EVALUATION RESULTS SUMMARY - {args.num_runs} RUNS")
         print("=" * 70)
 
-        # 先聚合核心指标 accuracy。标准差只在至少两轮时有意义。
         # Aggregate accuracy statistics
+        # 多轮准确率不只看均值，也看标准差、最小值、最大值，判断实验结果是否稳定。
         accuracies = [m.accuracy for m in all_run_metrics]
         print(f"\nAccuracy:")
         print(f"  Mean: {mean(accuracies):.3f}")
@@ -282,8 +284,8 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
         print(f"  Max: {max(accuracies):.3f}")
         print(f"  Runs: {[f'{a:.3f}' for a in accuracies]}")
 
-        # 上下文完整性也按多轮求均值，帮助观察检索配置整体是否稳定。
         # Aggregate completeness statistics
+        # completeness 聚合用于观察多轮下检索质量是否稳定，而不是只看最终答案正确率。
         complete_rates = [m.completeness_complete_rate for m in all_run_metrics]
         partial_rates = [m.completeness_partial_rate for m in all_run_metrics]
         insufficient_rates = [m.completeness_insufficient_rate for m in all_run_metrics]
@@ -293,23 +295,30 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
         print(f"  PARTIAL: {mean(partial_rates):.3f}")
         print(f"  INSUFFICIENT: {mean(insufficient_rates):.3f}")
 
-        # 某些 run 可能没有完整上下文样本，因此先过滤 None，再决定是否打印。
         # Aggregate accuracy with complete context
-        complete_ctx_accuracies = [m.accuracy_with_complete_context for m in all_run_metrics if m.accuracy_with_complete_context is not None]
+        # 有些 run 可能没有这个派生指标，所以先过滤 None。
+        complete_ctx_accuracies = [
+            m.accuracy_with_complete_context
+            for m in all_run_metrics
+            if m.accuracy_with_complete_context is not None
+        ]
         if complete_ctx_accuracies:
             print(f"\nAccuracy w/ Complete Context:")
             print(f"  Mean: {mean(complete_ctx_accuracies):.3f}")
             if len(complete_ctx_accuracies) > 1:
                 print(f"  Std Dev: {stdev(complete_ctx_accuracies):.3f}")
 
-        # 除了总体统计，也保留每一轮的摘要，方便快速发现异常 run。
         # Per-run details
+        # 除了聚合值，也保留每轮简要结果，方便快速发现某一轮异常偏高或偏低。
         print(f"\nPer-Run Results:")
         for idx, metrics in enumerate(all_run_metrics, 1):
-            print(f"  Run {idx}: Accuracy={metrics.accuracy:.3f}, Complete={metrics.completeness_complete_rate:.3f}")
+            print(
+                f"  Run {idx}: Accuracy={metrics.accuracy:.3f}, "
+                f"Complete={metrics.completeness_complete_rate:.3f}"
+            )
 
-        # 最后打印各类输出文件的位置，让用户能直接找到 summary、配置快照和各轮结果 JSON。
         # Show experiment directory location
+        # 多轮实验的文件结构比单轮复杂，因此明确打印根目录、summary、config 和各 run 结果文件名。
         print(f"\nExperiment directory: {experiment_dir}")
         print(f"Experiment summary: {experiment_dir / 'experiment_summary.json'}")
         print(f"Configuration: {experiment_dir / 'config.yaml'}")
@@ -320,55 +329,51 @@ async def evaluate_data(args: argparse.Namespace, logger: logging.Logger) -> Non
     logger.info(f"Evaluation complete. {args.num_runs} run(s) saved.")
 
 
+# --cleanup 模式对应的执行函数。
+# 它先列出所有 Zep graphs，再筛选当前 prefix 命名空间下的实验图；只有传入 --delete 时才会执行删除。
 async def cleanup_users(args: argparse.Namespace, logger: logging.Logger) -> None:
     """List and optionally delete all graphs from Zep with the specified prefix."""
-    # cleanup 模式和 ingest/eval 一样需要 Zep 客户端，但不需要 OpenAI 客户端，
-    # 因为它只操作图列表与图删除。
     # Initialize Zep client
+    # cleanup 只需要访问 Zep，不需要 OpenAI 客户端。
     zep = AsyncZep(api_key=os.getenv("ZEP_API_KEY"))
 
     logger.info("Fetching all graphs...")
 
-    # Zep 的 graph.list 是分页接口，所以这里逐页拉取所有图。
-    # all_graphs 先保存完整列表，后面再按 prefix 过滤，避免删除逻辑和分页逻辑耦合在一起。
     # List all graphs with pagination
+    # Zep graph.list 是分页接口，因此这里手动循环 page_number，直到没有更多结果。
     all_graphs = []
     page_number = 1
     page_size = 100
 
     while True:
+        # 每次拉一页 graph；page_size 设为 100 是为了减少 API 往返，同时避免单次返回过大。
         result = await zep.graph.list(page_size=page_size, page_number=page_number)
         if not result.graphs:
-            # 当前页没有图，说明已经没有更多数据，结束分页循环。
             break
         all_graphs.extend(result.graphs)
         page_number += 1
 
-        # 如果当前页数量小于 page_size，说明这一页已经是最后一页。
-        # 这比继续请求下一页更省一次网络调用。
         # Break if we've fetched all graphs
+        # 如果当前页数量小于 page_size，说明已经到最后一页，不需要再请求下一页。
         if len(result.graphs) < page_size:
             break
 
-    # 只处理当前 prefix 命名空间下的实验图，避免误删别的 benchmark 或用户图。
-    # 命名约定是：{prefix}_experiment_graph_ 开头。
     # Filter for graphs with the specified prefix
+    # ingest/eval 使用 prefix 构造 graph_id，这里用同样的命名规则找到当前实验命名空间下的 graphs。
     prefix_pattern = f"{args.prefix}_experiment_graph_"
     prefix_graphs = [g for g in all_graphs if g.graph_id.startswith(prefix_pattern)]
 
     if not prefix_graphs:
-        # 没有匹配图时直接返回；cleanup 的“列出”与“删除”两种模式都不需要继续执行。
         logger.info(f"No graphs found with prefix '{args.prefix}'.")
         return
 
-    # 先列出所有匹配图，无论是否删除，用户都能确认当前 prefix 会命中哪些 graph_id。
+    # 先列出将要处理的 graphs，让用户确认 cleanup 作用范围。
     logger.info(f"Found {len(prefix_graphs)} graphs with prefix '{args.prefix}':")
     for graph in prefix_graphs:
         logger.info(f"  - {graph.graph_id}")
 
-    # --cleanup 默认只是列出；只有额外传入 --delete 才进入删除流程。
-    # 删除前再次交互式确认，降低误操作风险。
     # Ask for confirmation if delete flag is set
+    # cleanup 默认只列出，不删除；只有显式 --delete 才进入危险操作。
     if args.delete:
         logger.warning(f"About to delete {len(prefix_graphs)} graphs with prefix '{args.prefix}'.")
         confirmation = input("Type 'yes' to confirm deletion: ")
@@ -376,9 +381,8 @@ async def cleanup_users(args: argparse.Namespace, logger: logging.Logger) -> Non
             logger.info("Deletion cancelled.")
             return
 
-        # 确认后逐个删除。这里没有因为单个删除失败而终止整个流程，
-        # 这样可以尽量清理掉能删除的图，并在日志中记录失败项。
         # Delete graphs
+        # 删除逐个执行，这样单个 graph 删除失败不会阻断后续 graph 的尝试。
         logger.info("Deleting graphs...")
         deleted_count = 0
         for graph in prefix_graphs:
@@ -391,22 +395,20 @@ async def cleanup_users(args: argparse.Namespace, logger: logging.Logger) -> Non
 
         logger.info(f"Successfully deleted {deleted_count}/{len(prefix_graphs)} graphs.")
     else:
-        # 没有 --delete 时保持只读行为，并提示用户如何触发删除。
+        # 没有 --delete 时只提示用户如何执行真正删除。
         logger.info("Use --delete flag to delete these graphs.")
 
 
+# CLI 的总入口。
+# 这个函数只做命令行层面的编排：环境变量、参数解析、日志、模式分发、异常出口。
 def main() -> None:
     """Main CLI entry point."""
-    # main 是同步函数，异步业务函数通过 asyncio.run 启动。
-    # 这样命令行入口简单清晰，也让 ingest/eval/cleanup 内部可以自然使用 await。
-
-    # 程序一开始就加载 .env，确保后续创建 Zep/OpenAI 客户端时能读到 API key。
     # Load environment variables
+    # 必须在创建 AsyncZep / AsyncOpenAI 前执行，否则 os.getenv(...) 可能拿不到 API key。
     load_dotenv()
 
-    # argparse 负责把用户输入的命令行选项转换成 args。
-    # RawDescriptionHelpFormatter 会保留 epilog 中多行示例的缩进和换行。
     # Create parser
+    # RawDescriptionHelpFormatter 会保留 epilog 里的换行和缩进，让示例命令更易读。
     parser = argparse.ArgumentParser(
         description="LOCOMO Evaluation Harness",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -445,8 +447,8 @@ Examples:
         """,
     )
 
-    # 三种运行模式互斥且必须选择一种，防止用户同时传 --ingest 和 --eval 造成流程语义冲突。
     # Mode selection (mutually exclusive)
+    # 三个模式互斥且必须选一个，避免用户同时触发 ingest/eval/cleanup 造成状态混乱。
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument("--ingest", action="store_true", help="Ingest data into Zep using graph API")
     mode_group.add_argument("--eval", action="store_true", help="Run evaluation")
@@ -454,9 +456,11 @@ Examples:
         "--cleanup", action="store_true", help="List or delete LOCOMO graphs from Zep"
     )
 
-    # 通用参数会被多个模式共享：
-    # config 控制实验配置；log-level 控制日志详细程度；prefix 控制图和实验命名空间。
     # Common arguments
+    # 这些参数对多个模式都有意义：
+    #   --config：控制实验配置
+    #   --log-level：控制日志详细程度
+    #   --prefix：给 Zep graph/user 命名加命名空间
     parser.add_argument(
         "--config",
         type=str,
@@ -477,9 +481,8 @@ Examples:
         help="Prefix for user/graph names to namespace experiments (default: locomo)",
     )
 
-    # num-runs 只在 --eval 下真正生效；放在公共 parser 上可以简化 argparse 结构。
-    # 当值大于 1 时，evaluate_data 会自动切换到多轮实验目录和聚合 summary 逻辑。
     # Evaluation-specific arguments
+    # num-runs 只在 --eval 时真正使用；ingest/cleanup 模式解析它但不会读取。
     parser.add_argument(
         "--num-runs",
         type=int,
@@ -487,26 +490,24 @@ Examples:
         help="Number of evaluation runs to perform (default: 1). Each run creates a separate experiment.",
     )
 
-    # --delete 只与 --cleanup 搭配使用；没有它时 cleanup 是安全的只读列表操作。
     # Cleanup-specific arguments
+    # --delete 是 cleanup 的安全开关：没有它时只列出 graphs，不会执行删除。
     parser.add_argument(
         "--delete",
         action="store_true",
         help="Delete users when using --cleanup (requires confirmation)",
     )
 
-    # 到这里，CLI 的所有结构已经定义完毕；parse_args 会根据用户输入生成 args，
-    # 并自动处理 --help、非法参数、缺少互斥模式等情况。
     # Parse arguments
+    # argparse 会在这里完成互斥模式校验、类型转换和默认值填充。
     args = parser.parse_args()
 
-    # 日志级别在 args 中已经确定，因此现在创建 logger，并传给后续业务函数。
     # Setup logging
+    # 日志等级来自命令行参数，之后传给各个 runner 保持统一输出。
     logger = setup_logging(args.log_level)
 
-    # 根据互斥模式分发到对应异步函数。
-    # 每个分支都用 asyncio.run，把 async 函数接入同步 CLI 入口。
     # Run appropriate mode
+    # 三条业务路径都是 async 函数；main 是同步入口，所以用 asyncio.run 创建事件循环并执行。
     try:
         if args.ingest:
             asyncio.run(ingest_data(args, logger))
@@ -515,15 +516,15 @@ Examples:
         elif args.cleanup:
             asyncio.run(cleanup_users(args, logger))
     except KeyboardInterrupt:
-        # Ctrl+C 中断时给出友好日志，并以非零状态码退出，方便脚本或 CI 判断失败。
+        # Ctrl+C 属于用户主动中断，记录简洁日志后用非零退出码结束。
         logger.info("Interrupted by user")
         sys.exit(1)
     except Exception as e:
-        # 其他异常统一记录堆栈信息；exc_info=True 对排查远程 API、配置、数据文件问题很关键。
+        # 其他异常记录完整 traceback，便于定位 runner、API 或配置错误。
         logger.error(f"Error: {e}", exc_info=True)
         sys.exit(1)
 
 
+# Python 脚本直接运行时进入 CLI；被其他模块 import 时不会自动执行。
 if __name__ == "__main__":
-    # 只有直接执行该文件时才启动 CLI；作为模块被导入时，不会立刻解析命令行或运行任务。
     main()
